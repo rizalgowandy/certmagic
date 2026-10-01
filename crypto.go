@@ -15,29 +15,35 @@
 package certmagic
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/fs"
 	"sort"
 	"strings"
 
 	"github.com/klauspost/cpuid/v2"
+	"github.com/mholt/acmez/v3/acme"
+	"github.com/zeebo/blake3"
 	"go.uber.org/zap"
 	"golang.org/x/net/idna"
 )
 
-// encodePrivateKey marshals a EC or RSA private key into a PEM-encoded array of bytes.
-func encodePrivateKey(key crypto.PrivateKey) ([]byte, error) {
+// PEMEncodePrivateKey marshals a private key into a PEM-encoded block.
+// The private key must be one of *ecdsa.PrivateKey, *rsa.PrivateKey, or
+// *ed25519.PrivateKey.
+func PEMEncodePrivateKey(key crypto.PrivateKey) ([]byte, error) {
 	var pemType string
 	var keyBytes []byte
 	switch key := key.(type) {
@@ -65,11 +71,13 @@ func encodePrivateKey(key crypto.PrivateKey) ([]byte, error) {
 	return pem.EncodeToMemory(&pemKey), nil
 }
 
-// decodePrivateKey loads a PEM-encoded ECC/RSA private key from an array of bytes.
+// PEMDecodePrivateKey loads a PEM-encoded ECC/RSA private key from an array of bytes.
 // Borrowed from Go standard library, to handle various private key and PEM block types.
-// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L291-L308
-// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L238)
-func decodePrivateKey(keyPEMBytes []byte) (crypto.Signer, error) {
+func PEMDecodePrivateKey(keyPEMBytes []byte) (crypto.Signer, error) {
+	// Modified from original:
+	// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L291-L308
+	// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L238
+
 	keyBlockDER, _ := pem.Decode(keyPEMBytes)
 
 	if keyBlockDER == nil {
@@ -136,7 +144,7 @@ func fastHash(input []byte) string {
 // saveCertResource saves the certificate resource to disk. This
 // includes the certificate file itself, the private key, and the
 // metadata file.
-func (cfg *Config) saveCertResource(issuer Issuer, cert CertificateResource) error {
+func (cfg *Config) saveCertResource(ctx context.Context, issuer Issuer, cert CertificateResource) error {
 	metaBytes, err := json.MarshalIndent(cert, "", "\t")
 	if err != nil {
 		return fmt.Errorf("encoding certificate metadata: %v", err)
@@ -160,19 +168,21 @@ func (cfg *Config) saveCertResource(issuer Issuer, cert CertificateResource) err
 		},
 	}
 
-	return storeTx(cfg.Storage, all)
+	return storeTx(ctx, cfg.groundTruthStorage(), all)
 }
 
 // loadCertResourceAnyIssuer loads and returns the certificate resource from any
 // of the configured issuers. If multiple are found (e.g. if there are 3 issuers
 // configured, and all 3 have a resource matching certNamesKey), then the newest
-// (latest NotBefore date) resource will be chosen.
-func (cfg *Config) loadCertResourceAnyIssuer(certNamesKey string) (CertificateResource, error) {
-	// we can save some extra decoding steps if there's only one issuer, since
+// (latest NotBefore date) resource will be chosen. If LoadFirstUsableCert is
+// set, the issuers after the first one holding a resource that does not need
+// renewal are not read. Callers pass the storage to load from: see
+// cachedStorage and groundTruthStorage.
+func (cfg *Config) loadCertResourceAnyIssuer(ctx context.Context, certNamesKey string, storage Storage) (CertificateResource, error) {	// we can save some extra decoding steps if there's only one issuer, since
 	// we don't need to compare potentially multiple available resources to
 	// select the best one, when there's only one choice anyway
 	if len(cfg.Issuers) == 1 {
-		return cfg.loadCertResource(cfg.Issuers[0], certNamesKey)
+		return cfg.loadCertResource(ctx, cfg.Issuers[0], certNamesKey, storage)
 	}
 
 	type decodedCertResource struct {
@@ -186,9 +196,9 @@ func (cfg *Config) loadCertResourceAnyIssuer(certNamesKey string) (CertificateRe
 	// load and decode all certificate resources found with the
 	// configured issuers so we can sort by newest
 	for _, issuer := range cfg.Issuers {
-		certRes, err := cfg.loadCertResource(issuer, certNamesKey)
+		certRes, err := cfg.loadCertResource(ctx, issuer, certNamesKey, storage)
 		if err != nil {
-			if _, ok := err.(ErrNotExist); ok {
+			if errors.Is(err, fs.ErrNotExist) {
 				// not a problem, but we need to remember the error
 				// in case we end up not finding any cert resources
 				// since we'll need an error to return in that case
@@ -206,6 +216,21 @@ func (cfg *Config) loadCertResourceAnyIssuer(certNamesKey string) (CertificateRe
 			issuer:              issuer,
 			decoded:             certs[0],
 		})
+
+		// this issuer is preferred over the ones after it, so if its
+		// certificate is one we would serve as-is, reading theirs can only
+		// cost round-trips to find certificates we would not use
+		if cfg.LoadFirstUsableCert {
+			var ari acme.RenewalInfo
+			if !cfg.DisableARI {
+				if ariPtr, err := certRes.getARI(); err == nil && ariPtr != nil {
+					ari = *ariPtr
+				}
+			}
+			if !cfg.certNeedsRenewal(certs[0], ari, false) {
+				break
+			}
+		}
 	}
 	if len(certResources) == 0 {
 		if lastErr == nil {
@@ -219,44 +244,57 @@ func (cfg *Config) loadCertResourceAnyIssuer(certNamesKey string) (CertificateRe
 		return certResources[j].decoded.NotBefore.Before(certResources[i].decoded.NotBefore)
 	})
 
-	if cfg.Logger != nil {
-		cfg.Logger.Debug("loading managed certificate",
-			zap.String("domain", certNamesKey),
-			zap.Time("expiration", certResources[0].decoded.NotAfter),
-			zap.String("issuer_key", certResources[0].issuer.IssuerKey()),
-			zap.Any("storage", cfg.Storage),
-		)
-	}
+	cfg.Logger.Debug("loading managed certificate",
+		zap.String("domain", certNamesKey),
+		zap.Time("expiration", expiresAt(certResources[0].decoded)),
+		zap.String("issuer_key", certResources[0].issuer.IssuerKey()),
+		zap.Any("storage", cfg.Storage),
+	)
 
 	return certResources[0].CertificateResource, nil
 }
 
-// loadCertResource loads a certificate resource from the given issuer's storage location.
-func (cfg *Config) loadCertResource(issuer Issuer, certNamesKey string) (CertificateResource, error) {
+// loadCertResource loads a certificate resource from the given issuer's storage
+// location, using the given storage: see cachedStorage and groundTruthStorage.
+// A resource from the local cache that is due for renewal is read from Storage
+// instead, in case another instance already renewed it.
+func (cfg *Config) loadCertResource(ctx context.Context, issuer Issuer, certNamesKey string, storage Storage) (CertificateResource, error) {
 	certRes := CertificateResource{issuerKey: issuer.IssuerKey()}
 
+	// don't use the Lookup profile because we might be loading a wildcard cert which is rejected by the Lookup profile
 	normalizedName, err := idna.ToASCII(certNamesKey)
 	if err != nil {
 		return CertificateResource{}, fmt.Errorf("converting '%s' to ASCII: %v", certNamesKey, err)
 	}
 
-	certBytes, err := cfg.Storage.Load(StorageKeys.SiteCert(certRes.issuerKey, normalizedName))
-	if err != nil {
-		return CertificateResource{}, err
-	}
-	certRes.CertificatePEM = certBytes
-	keyBytes, err := cfg.Storage.Load(StorageKeys.SitePrivateKey(certRes.issuerKey, normalizedName))
+	keyBytes, err := storage.Load(ctx, StorageKeys.SitePrivateKey(certRes.issuerKey, normalizedName))
 	if err != nil {
 		return CertificateResource{}, err
 	}
 	certRes.PrivateKeyPEM = keyBytes
-	metaBytes, err := cfg.Storage.Load(StorageKeys.SiteMeta(certRes.issuerKey, normalizedName))
+	certBytes, err := storage.Load(ctx, StorageKeys.SiteCert(certRes.issuerKey, normalizedName))
+	if err != nil {
+		return CertificateResource{}, err
+	}
+	certRes.CertificatePEM = certBytes
+	metaBytes, err := storage.Load(ctx, StorageKeys.SiteMeta(certRes.issuerKey, normalizedName))
 	if err != nil {
 		return CertificateResource{}, err
 	}
 	err = json.Unmarshal(metaBytes, &certRes)
 	if err != nil {
 		return CertificateResource{}, fmt.Errorf("decoding certificate metadata: %v", err)
+	}
+
+	// the local cache only learns of renewals this instance does, so a cached
+	// certificate due for renewal is the one a peer most likely replaced; the
+	// Storage read refreshes the local copy, so this is paid once per renewal
+	if ls, ok := storage.(localCacheStorage); ok && ls.readLocal {
+		if _, _, stale := cfg.managedCertNeedsRenewal(certRes, false); stale {
+			if current, err := cfg.loadCertResource(ctx, issuer, certNamesKey, cfg.groundTruthStorage()); err == nil {
+				return current, nil
+			}
+		}
 	}
 
 	return certRes, nil
@@ -266,7 +304,7 @@ func (cfg *Config) loadCertResource(issuer Issuer, certNamesKey string) (Certifi
 // which is the chain of DER-encoded bytes. It returns the
 // hex encoding of the hash.
 func hashCertificateChain(certChain [][]byte) string {
-	h := sha256.New()
+	h := blake3.New()
 	for _, certInChain := range certChain {
 		h.Write(certInChain)
 	}
@@ -275,6 +313,11 @@ func hashCertificateChain(certChain [][]byte) string {
 
 func namesFromCSR(csr *x509.CertificateRequest) []string {
 	var nameSet []string
+	// TODO: CommonName should not be used (it has been deprecated for 25+ years,
+	// but ZeroSSL CA still requires it to be filled out and not overlap SANs...)
+	if csr.Subject.CommonName != "" {
+		nameSet = append(nameSet, csr.Subject.CommonName)
+	}
 	nameSet = append(nameSet, csr.DNSNames...)
 	nameSet = append(nameSet, csr.EmailAddresses...)
 	for _, v := range csr.IPAddresses {

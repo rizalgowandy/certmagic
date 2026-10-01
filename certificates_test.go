@@ -18,16 +18,58 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
 
+func TestCertificateNeedsRenewalConcurrentCacheOptions(t *testing.T) {
+	certCache := &Cache{logger: defaultTestLogger}
+	cacheOptions := CacheOptions{
+		GetConfigForCert:   func(Certificate) (*Config, error) { return nil, nil },
+		RenewCheckInterval: time.Minute,
+	}
+	certCache.SetOptions(cacheOptions)
+
+	now := time.Now()
+	cert := Certificate{Certificate: tls.Certificate{Leaf: &x509.Certificate{
+		NotBefore: now.Add(-24 * time.Hour),
+		NotAfter:  now.Add(24 * time.Hour),
+	}}}
+	cfg := &Config{
+		certCache:  certCache,
+		DisableARI: true,
+		Logger:     defaultTestLogger,
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 10_000; i++ {
+			cacheOptions.RenewCheckInterval = time.Duration(i%2+1) * time.Minute
+			certCache.SetOptions(cacheOptions)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 10_000; i++ {
+			cert.NeedsRenewal(cfg)
+		}
+	}()
+	close(start)
+	wg.Wait()
+}
+
 func TestUnexportedGetCertificate(t *testing.T) {
-	certCache := &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string)}
-	cfg := &Config{certCache: certCache}
+	certCache := &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger}
+	cfg := &Config{Logger: defaultTestLogger, certCache: certCache}
 
 	// When cache is empty
-	if _, matched, defaulted := cfg.getCertificate(&tls.ClientHelloInfo{ServerName: "example.com"}); matched || defaulted {
+	if _, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "example.com"}); matched || defaulted {
 		t.Errorf("Got a certificate when cache was empty; matched=%v, defaulted=%v", matched, defaulted)
 	}
 
@@ -35,25 +77,25 @@ func TestUnexportedGetCertificate(t *testing.T) {
 	firstCert := Certificate{Names: []string{"example.com"}}
 	certCache.cache["0xdeadbeef"] = firstCert
 	certCache.cacheIndex["example.com"] = []string{"0xdeadbeef"}
-	if cert, matched, defaulted := cfg.getCertificate(&tls.ClientHelloInfo{ServerName: "example.com"}); !matched || defaulted || cert.Names[0] != "example.com" {
+	if cert, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "example.com"}); !matched || defaulted || cert.Names[0] != "example.com" {
 		t.Errorf("Didn't get a cert for 'example.com' or got the wrong one: %v, matched=%v, defaulted=%v", cert, matched, defaulted)
 	}
 
 	// When retrieving wildcard certificate
 	certCache.cache["0xb01dface"] = Certificate{Names: []string{"*.example.com"}}
 	certCache.cacheIndex["*.example.com"] = []string{"0xb01dface"}
-	if cert, matched, defaulted := cfg.getCertificate(&tls.ClientHelloInfo{ServerName: "sub.example.com"}); !matched || defaulted || cert.Names[0] != "*.example.com" {
+	if cert, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "sub.example.com"}); !matched || defaulted || cert.Names[0] != "*.example.com" {
 		t.Errorf("Didn't get wildcard cert for 'sub.example.com' or got the wrong one: %v, matched=%v, defaulted=%v", cert, matched, defaulted)
 	}
 
 	// When no certificate matches and SNI is provided, return no certificate (should be TLS alert)
-	if cert, matched, defaulted := cfg.getCertificate(&tls.ClientHelloInfo{ServerName: "nomatch"}); matched || defaulted {
+	if cert, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "nomatch"}); matched || defaulted {
 		t.Errorf("Expected matched=false, defaulted=false; but got matched=%v, defaulted=%v (cert: %v)", matched, defaulted, cert)
 	}
 }
 
 func TestCacheCertificate(t *testing.T) {
-	certCache := &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string)}
+	certCache := &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger}
 
 	certCache.cacheCertificate(Certificate{Names: []string{"example.com", "sub.example.com"}, hash: "foobar", Certificate: tls.Certificate{Leaf: &x509.Certificate{NotAfter: time.Now()}}})
 	if len(certCache.cache) != 1 {
@@ -143,7 +185,8 @@ func TestSubjectQualifiesForPublicCert(t *testing.T) {
 		{"Sub.Example.COM", true},
 		{"127.0.0.1", false},
 		{"127.0.1.5", false},
-		{"69.123.43.94", false},
+		{"1.2.3.4", true},
+		{"69.123.43.94", true},
 		{"::1", false},
 		{"::", false},
 		{"0.0.0.0", false},
@@ -162,9 +205,13 @@ func TestSubjectQualifiesForPublicCert(t *testing.T) {
 		{"local", true},
 		{"foo.local", false},
 		{"foo.bar.local", false},
+		{"foo.internal", false},
+		{"foo.bar.internal", false},
+		{"foo.home.arpa", false},
+		{"foo.bar.home.arpa", false},
 		{"192.168.1.3", false},
 		{"10.0.2.1", false},
-		{"169.112.53.4", false},
+		{"169.112.53.4", true},
 		{"$hostname", false},
 		{"%HOSTNAME%", false},
 		{"{hostname}", false},
@@ -184,16 +231,51 @@ func TestSubjectQualifiesForPublicCert(t *testing.T) {
 	}
 }
 
+func TestHostOnly(t *testing.T) {
+	for i, test := range []struct {
+		input  string
+		expect string
+	}{
+		// hostname without port
+		{"example.com", "example.com"},
+		// hostname with port
+		{"example.com:443", "example.com"},
+		// IPv4 without port
+		{"1.2.3.4", "1.2.3.4"},
+		// IPv4 with port
+		{"1.2.3.4:80", "1.2.3.4"},
+		// IPv6 without port and without brackets
+		{"::1", "::1"},
+		// IPv6 with port (brackets required by RFC 7230)
+		{"[::1]:80", "::1"},
+		// IPv6 without port but with brackets (Go's HTTP server format for host-only)
+		{"[::1]", "::1"},
+		// full IPv6 without port but with brackets
+		{"[2001:db8::1]", "2001:db8::1"},
+		// full IPv6 with port
+		{"[2001:db8::1]:8080", "2001:db8::1"},
+	} {
+		actual := hostOnly(test.input)
+		if actual != test.expect {
+			t.Errorf("Test %d: hostOnly(%q) = %q, want %q", i, test.input, actual, test.expect)
+		}
+	}
+}
+
 func TestMatchWildcard(t *testing.T) {
 	for i, test := range []struct {
 		subject, wildcard string
 		expect            bool
 	}{
 		{"hostname", "hostname", true},
+		{"HOSTNAME", "hostname", true},
+		{"hostname", "HOSTNAME", true},
 		{"foo.localhost", "foo.localhost", true},
 		{"foo.localhost", "bar.localhost", false},
 		{"foo.localhost", "*.localhost", true},
 		{"bar.localhost", "*.localhost", true},
+		{"FOO.LocalHost", "*.localhost", true},
+		{"Bar.localhost", "*.LOCALHOST", true},
 		{"foo.bar.localhost", "*.localhost", false},
 		{".localhost", "*.localhost", false},
 		{"foo.localhost", "foo.*", false},
@@ -208,6 +290,10 @@ func TestMatchWildcard(t *testing.T) {
 		{"1.2.3.4.5.6", "*.*.*.*.*.*", true},
 		{"0.1.2.3.4.5.6", "*.*.*.*.*.*", false},
 		{"1.2.3.4", "1.2.3.*", false}, // https://tools.ietf.org/html/rfc2818#section-3.1
+		// Bracketed IPv6 subjects (from HTTP Host headers) must match bare IPv6 wildcards.
+		{"[::1]", "::1", true},
+		{"[2001:db8::1]", "2001:db8::1", true},
+		{"[::1]", "::2", false},
 	} {
 		actual := MatchWildcard(test.subject, test.wildcard)
 		if actual != test.expect {

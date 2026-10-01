@@ -7,11 +7,15 @@ package certmagic
 // It has been modified.
 
 import (
+	"context"
 	"net"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 func TestLookupNameserversOK(t *testing.T) {
@@ -20,25 +24,18 @@ func TestLookupNameserversOK(t *testing.T) {
 		nss  []string
 	}{
 		{
-			fqdn: "books.google.com.ng.",
-			nss:  []string{"ns1.google.com.", "ns2.google.com.", "ns3.google.com.", "ns4.google.com."},
-		},
-		{
-			fqdn: "www.google.com.",
-			nss:  []string{"ns1.google.com.", "ns2.google.com.", "ns3.google.com.", "ns4.google.com."},
-		},
-		{
 			fqdn: "physics.georgetown.edu.",
-			nss:  []string{"ns4.georgetown.edu.", "ns5.georgetown.edu.", "ns6.georgetown.edu."},
+			nss:  []string{"ns.b1ddi.physics.georgetown.edu.", "ns4.georgetown.edu.", "ns5.georgetown.edu.", "ns6.georgetown.edu."},
 		},
 	}
 
 	for i, test := range testCases {
 		test := test
+		i := i
 		t.Run(test.fqdn, func(t *testing.T) {
 			t.Parallel()
 
-			nss, err := lookupNameservers(test.fqdn, recursiveNameservers(nil))
+			nss, err := lookupNameservers(context.Background(), zap.NewNop(), test.fqdn, RecursiveNameservers(nil))
 			if err != nil {
 				t.Errorf("Expected no error, got: %v", err)
 			}
@@ -68,10 +65,11 @@ func TestLookupNameserversErr(t *testing.T) {
 
 	for i, test := range testCases {
 		test := test
+		i := i
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := lookupNameservers(test.fqdn, nil)
+			_, err := lookupNameservers(context.Background(), zap.NewNop(), test.fqdn, nil)
 			if err == nil {
 				t.Errorf("expected error, got none")
 			}
@@ -89,34 +87,35 @@ var findXByFqdnTestCases = []struct {
 	primaryNs     string
 	nameservers   []string
 	expectedError string
+	skipTest      bool
 }{
 	{
 		desc:        "domain is a CNAME",
 		fqdn:        "scholar.google.com.",
 		zone:        "google.com.",
 		primaryNs:   "ns1.google.com.",
-		nameservers: recursiveNameservers(nil),
+		nameservers: RecursiveNameservers(nil),
 	},
 	{
 		desc:        "domain is a non-existent subdomain",
 		fqdn:        "foo.google.com.",
 		zone:        "google.com.",
 		primaryNs:   "ns1.google.com.",
-		nameservers: recursiveNameservers(nil),
+		nameservers: RecursiveNameservers(nil),
 	},
 	{
 		desc:        "domain is a eTLD",
 		fqdn:        "example.com.ac.",
 		zone:        "ac.",
 		primaryNs:   "a0.nic.ac.",
-		nameservers: recursiveNameservers(nil),
+		nameservers: RecursiveNameservers(nil),
 	},
 	{
 		desc:        "domain is a cross-zone CNAME",
 		fqdn:        "cross-zone-example.assets.sh.",
 		zone:        "assets.sh.",
 		primaryNs:   "gina.ns.cloudflare.com.",
-		nameservers: recursiveNameservers(nil),
+		nameservers: RecursiveNameservers(nil),
 	},
 	{
 		desc:          "NXDOMAIN",
@@ -131,6 +130,9 @@ var findXByFqdnTestCases = []struct {
 		zone:        "google.com.",
 		primaryNs:   "ns1.google.com.",
 		nameservers: []string{":7053", ":8053", "1.1.1.1:53"},
+		// Windows takes a super long time to timeout and this negatively impacts CI.
+		// Essentially, we know this works, but Windows is just slow to give up.
+		skipTest: runtime.GOOS == "windows",
 	},
 	{
 		desc:          "only non existent nameservers",
@@ -138,6 +140,9 @@ var findXByFqdnTestCases = []struct {
 		zone:          "google.com.",
 		nameservers:   []string{":7053", ":8053", ":9053"},
 		expectedError: "could not find the start of authority for scholar.google.com.:",
+		// Windows takes a super long time to timeout and this negatively impacts CI.
+		// Essentially, we know this works, but Windows is just slow to give up.
+		skipTest: runtime.GOOS == "windows",
 	},
 	{
 		desc:          "no nameservers",
@@ -151,9 +156,12 @@ var findXByFqdnTestCases = []struct {
 func TestFindZoneByFqdn(t *testing.T) {
 	for i, test := range findXByFqdnTestCases {
 		t.Run(test.desc, func(t *testing.T) {
+			if test.skipTest {
+				t.Skip("skipping test")
+			}
 			clearFqdnCache()
 
-			zone, err := findZoneByFQDN(test.fqdn, test.nameservers)
+			zone, err := FindZoneByFQDN(context.Background(), zap.NewNop(), test.fqdn, test.nameservers)
 			if test.expectedError != "" {
 				if err == nil {
 					t.Errorf("test %d: expected error, got none", i)
@@ -186,7 +194,7 @@ func TestResolveConfServers(t *testing.T) {
 			expected: []string{"10.200.3.249", "10.200.3.250:5353", "2001:4860:4860::8844", "[10.0.0.1]:5353"},
 		},
 		{
-			fixture:  "testdata/resolv.conf.nonexistant",
+			fixture:  "testdata/resolv.conf.nonexistent",
 			defaults: []string{"127.0.0.1:53"},
 			expected: []string{"127.0.0.1:53"},
 		},
@@ -212,7 +220,7 @@ func TestRecursiveNameserversAddsPort(t *testing.T) {
 	}
 	custom := []string{"127.0.0.1", "ns1.google.com:43"}
 	expectations := []want{{port: "53"}, {port: "43"}}
-	results := recursiveNameservers(custom)
+	results := RecursiveNameservers(custom)
 
 	if !reflect.DeepEqual(custom, []string{"127.0.0.1", "ns1.google.com:43"}) {
 		t.Errorf("Expected custom nameservers to be unmodified. got %v", custom)
@@ -240,12 +248,12 @@ func TestRecursiveNameserversAddsPort(t *testing.T) {
 }
 
 func TestRecursiveNameserversDefaults(t *testing.T) {
-	results := recursiveNameservers(nil)
+	results := RecursiveNameservers(nil)
 	if len(results) < 1 {
 		t.Errorf("%v Expected at least 1 records as default when nil custom", results)
 	}
 
-	results = recursiveNameservers([]string{})
+	results = RecursiveNameservers([]string{})
 	if len(results) < 1 {
 		t.Errorf("%v Expected at least 1 records as default when empty custom", results)
 	}

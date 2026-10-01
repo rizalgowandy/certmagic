@@ -16,11 +16,12 @@ package certmagic
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
@@ -28,27 +29,31 @@ import (
 	"golang.org/x/crypto/ocsp"
 )
 
+// ErrNoOCSPServerSpecified indicates that OCSP information could not be
+// stapled because the certificate does not support OCSP.
+var ErrNoOCSPServerSpecified = errors.New("no OCSP server specified in certificate")
+
 // stapleOCSP staples OCSP information to cert for hostname name.
 // If you have it handy, you should pass in the PEM-encoded certificate
 // bundle; otherwise the DER-encoded cert will have to be PEM-encoded.
 // If you don't have the PEM blocks already, just pass in nil.
 //
-// Errors here are not necessarily fatal, it could just be that the
-// certificate doesn't have an issuer URL. This function may return
-// both nil values if OCSP stapling is disabled according to ocspConfig.
+// If successful, the OCSP response will be set to cert's ocsp field,
+// regardless of the OCSP status. It is only stapled, however, if the
+// status is Good.
 //
-// If a status was received, it returns that status. Note that the
-// returned status is not always stapled to the certificate.
-func stapleOCSP(ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBundle []byte) (*ocsp.Response, error) {
+// Errors here are not necessarily fatal, it could just be that the
+// certificate doesn't have an issuer URL.
+func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBundle []byte) error {
 	if ocspConfig.DisableStapling {
-		return nil, nil
+		return nil
 	}
 
 	if pemBundle == nil {
 		// we need a PEM encoding only for some function calls below
 		bundle := new(bytes.Buffer)
 		for _, derBytes := range cert.Certificate.Certificate {
-			pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+			_ = pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 		}
 		pemBundle = bundle.Bytes()
 	}
@@ -61,7 +66,7 @@ func stapleOCSP(ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBu
 	// First try to load OCSP staple from storage and see if
 	// we can still use it.
 	ocspStapleKey := StorageKeys.OCSPStaple(cert, pemBundle)
-	cachedOCSP, err := storage.Load(ocspStapleKey)
+	cachedOCSP, err := storage.Load(ctx, ocspStapleKey)
 	if err == nil {
 		resp, err := ocsp.ParseResponse(cachedOCSP, nil)
 		if err == nil {
@@ -77,7 +82,7 @@ func stapleOCSP(ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBu
 			// because we loaded it by name, whereas the maintenance routine
 			// just iterates the list of files, even if somehow a non-staple
 			// file gets in the folder. in this case we are sure it is corrupt.)
-			err := storage.Delete(ocspStapleKey)
+			err := storage.Delete(ctx, ocspStapleKey)
 			if err != nil {
 				log.Printf("[WARNING] Unable to delete invalid OCSP staple file: %v", err)
 			}
@@ -88,38 +93,47 @@ func stapleOCSP(ocspConfig OCSPConfig, storage Storage, cert *Certificate, pemBu
 	// then we need to request it from the OCSP responder
 	if ocspResp == nil || len(ocspBytes) == 0 {
 		ocspBytes, ocspResp, ocspErr = getOCSPForCert(ocspConfig, pemBundle)
+		// An error here is not a problem because a certificate
+		// may simply not contain a link to an OCSP server.
 		if ocspErr != nil {
-			// An error here is not a problem because a certificate may simply
-			// not contain a link to an OCSP server. But we should log it anyway.
+			// For short-lived certificates, this is fine and we can ignore
+			// logging because OCSP doesn't make much sense for them anyway.
+			if cert.Lifetime() < 7*24*time.Hour {
+				return nil
+			}
 			// There's nothing else we can do to get OCSP for this certificate,
-			// so we can return here with the error.
-			return nil, fmt.Errorf("no OCSP stapling for %v: %v", cert.Names, ocspErr)
+			// so we can return here with the error to warn about it.
+			return fmt.Errorf("no OCSP stapling for %v: %w", cert.Names, ocspErr)
 		}
 		gotNewOCSP = true
 	}
 
-	// By now, we should have a response. If good, staple it to
-	// the certificate. If the OCSP response was not loaded from
-	// storage, we persist it for next time.
+	if ocspResp.NextUpdate.After(expiresAt(cert.Leaf)) {
+		// uh oh, this OCSP response expires AFTER the certificate does, that's kinda bogus.
+		// it was the reason a lot of Symantec-validated sites (not Caddy) went down
+		// in October 2017. https://twitter.com/mattiasgeniar/status/919432824708648961
+		return fmt.Errorf("invalid: OCSP response for %v valid after certificate expiration (%s)",
+			cert.Names, expiresAt(cert.Leaf).Sub(ocspResp.NextUpdate))
+	}
+
+	// Attach the latest OCSP response to the certificate; this is NOT the same
+	// as stapling it, which we do below only if the status is Good, but it is
+	// useful to keep with the cert in order to act on it later (like if Revoked).
+	cert.ocsp = ocspResp
+
+	// If the response is good, staple it to the certificate. If the OCSP
+	// response was not loaded from storage, we persist it for next time.
 	if ocspResp.Status == ocsp.Good {
-		if ocspResp.NextUpdate.After(cert.Leaf.NotAfter) {
-			// uh oh, this OCSP response expires AFTER the certificate does, that's kinda bogus.
-			// it was the reason a lot of Symantec-validated sites (not Caddy) went down
-			// in October 2017. https://twitter.com/mattiasgeniar/status/919432824708648961
-			return ocspResp, fmt.Errorf("invalid: OCSP response for %v valid after certificate expiration (%s)",
-				cert.Names, cert.Leaf.NotAfter.Sub(ocspResp.NextUpdate))
-		}
 		cert.Certificate.OCSPStaple = ocspBytes
-		cert.ocsp = ocspResp
 		if gotNewOCSP {
-			err := storage.Store(ocspStapleKey, ocspBytes)
+			err := storage.Store(ctx, ocspStapleKey, ocspBytes)
 			if err != nil {
-				return ocspResp, fmt.Errorf("unable to write OCSP staple file for %v: %v", cert.Names, err)
+				return fmt.Errorf("unable to write OCSP staple file for %v: %v", cert.Names, err)
 			}
 		}
 	}
 
-	return ocspResp, nil
+	return nil
 }
 
 // getOCSPForCert takes a PEM encoded cert or cert bundle returning the raw OCSP response,
@@ -145,7 +159,7 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 	// we have only one certificate so far, we need to get the issuer cert.
 	issuedCert := certificates[0]
 	if len(issuedCert.OCSPServer) == 0 {
-		return nil, nil, fmt.Errorf("no OCSP server specified in certificate")
+		return nil, nil, ErrNoOCSPServerSpecified
 	}
 
 	// apply override for responder URL
@@ -159,18 +173,30 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 		return nil, nil, fmt.Errorf("override disables querying OCSP responder: %v", issuedCert.OCSPServer[0])
 	}
 
+	// configure HTTP client if necessary
+	httpClient := http.DefaultClient
+	if ocspConfig.HTTPProxy != nil {
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy: ocspConfig.HTTPProxy,
+			},
+			Timeout: 30 * time.Second,
+		}
+	}
+
+	// get issuer certificate if needed
 	if len(certificates) == 1 {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, nil, fmt.Errorf("no URL to issuing certificate")
 		}
 
-		resp, err := http.Get(issuedCert.IssuingCertificateURL[0])
+		resp, err := httpClient.Get(issuedCert.IssuingCertificateURL[0])
 		if err != nil {
 			return nil, nil, fmt.Errorf("getting issuer certificate: %v", err)
 		}
 		defer resp.Body.Close()
 
-		issuerBytes, err := ioutil.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		issuerBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading issuer certificate: %v", err)
 		}
@@ -193,13 +219,13 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 	}
 
 	reader := bytes.NewReader(ocspReq)
-	req, err := http.Post(respURL, "application/ocsp-request", reader)
+	req, err := httpClient.Post(respURL, "application/ocsp-request", reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("making OCSP request: %v", err)
 	}
 	defer req.Body.Close()
 
-	ocspResBytes, err := ioutil.ReadAll(io.LimitReader(req.Body, 1024*1024))
+	ocspResBytes, err := io.ReadAll(io.LimitReader(req.Body, 1024*1024))
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading OCSP response: %v", err)
 	}
@@ -207,6 +233,10 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 	ocspRes, err := ocsp.ParseResponse(ocspResBytes, issuerCert)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing OCSP response: %v", err)
+	}
+
+	if err := validateOCSPResponder(ocspRes, issuerCert); err != nil {
+		return nil, nil, fmt.Errorf("OCSP responder authorization check failed: %v", err)
 	}
 
 	return ocspResBytes, ocspRes, nil
@@ -226,4 +256,27 @@ func freshOCSP(resp *ocsp.Response) bool {
 	// start checking OCSP staple about halfway through validity period for good measure
 	refreshTime := resp.ThisUpdate.Add(nextUpdate.Sub(resp.ThisUpdate) / 2)
 	return time.Now().Before(refreshTime)
+}
+
+// validateOCSPResponder enforces RFC 6960 §4.2.2.2: "Systems or applications that
+// rely on OCSP responses MUST be capable of detecting and enforcing the use of the
+// id-kp-OCSPSigning value." An issuer-signed response (where the embedded Certificate
+// field is nil, meaning the issuer signed directly) is always acceptable.
+func validateOCSPResponder(ocspResp *ocsp.Response, issuerCert *x509.Certificate) error {
+	respCert := ocspResp.Certificate
+
+	// if response was signed directly by the issuer, or embedded responder cert IS the issuer, accept
+	if respCert == nil || respCert.Equal(issuerCert) {
+		// Response was signed directly by the issuer — always valid.
+		return nil
+	}
+
+	// RFC 6960 §4.2.2.2 requires id-kp-OCSPSigning for delegated responders
+	for _, eku := range respCert.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageOCSPSigning {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("OCSP responder certificate (subject: %s) is not the issuer and does not carry id-kp-OCSPSigning", respCert.Subject)
 }
